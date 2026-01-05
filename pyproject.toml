@@ -1,0 +1,23 @@
+[project]
+name = "grouped-norm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Fr4nk1in", email = "fushen@mail.ustc.edu.cn" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.0",
+    "torch>=2.9.1",
+    "triton>=3.5.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
