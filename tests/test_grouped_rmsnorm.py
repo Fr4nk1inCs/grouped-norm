@@ -16,7 +16,7 @@ class SequentialRMSNorm(GroupedNorm):
         dtype: torch.dtype | None = None,
     ):
         super().__init__(num_norms, hidden_size, eps, dtype)
-        self.weight = nn.Parameter(torch.ones(num_norms, hidden_size))
+        self.weight = nn.Parameter(torch.ones(num_norms, hidden_size, dtype=self.dtype))
 
     def forward(self, x: torch.Tensor, m_splits: List[int]) -> torch.Tensor:
         outputs = []
@@ -43,11 +43,15 @@ def test_grouped_rmsnorm_equivalence():
     hidden_size = 512
     eps = 1e-5
 
-    torch.set_default_device(torch.device("cuda:0"))
-    torch.set_default_dtype(torch.float32)
+    device = torch.device("cuda:0")
+    dtype = torch.float32
 
-    grouped_rmsnorm = GroupedRMSNorm(num_norms, hidden_size, eps).cuda()
-    sequential_rmsnorm = SequentialRMSNorm(num_norms, hidden_size, eps).cuda()
+    grouped_rmsnorm = GroupedRMSNorm(num_norms, hidden_size, eps, dtype).to(
+        device=device
+    )
+    sequential_rmsnorm = SequentialRMSNorm(num_norms, hidden_size, eps, dtype).to(
+        device=device
+    )
 
     m_splits = [random.randint(0, 96) for _ in range(num_norms)]
     batch_size = sum(m_splits)

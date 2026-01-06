@@ -229,7 +229,8 @@ class GroupedRMSNormFunction(torch.autograd.Function):
         m_splits_dev = torch.tensor(m_splits, dtype=torch.int32, device=device)
         seg_indptr = seg_indptr_from_splits(m_splits_dev)
 
-        max_split = max(m_splits)
+        max_split = max(m_splits) if m_splits else 0
+        assert max_split > 0, "All splits are zero."
 
         y = torch.empty_like(x)
         rstd = torch.empty(b, dtype=x.dtype, device=device)
