@@ -52,11 +52,6 @@ class AllocKwargs(TypedDict):
     dtype: torch.dtype
 
 
-class TolKwargs(TypedDict):
-    rtol: float
-    atol: float
-
-
 NormT = TypeVar("NormT", bound=GroupedNorm)
 
 
@@ -72,11 +67,6 @@ class ModelConfig:
     @property
     def alloc_kwargs(self):
         return AllocKwargs(device=self.device, dtype=self.dtype)
-
-    @property
-    def tolerance(self):
-        tol = 1e-2 if self.dtype.itemsize <= 2 else 1e-5
-        return TolKwargs(rtol=tol, atol=tol)
 
     def build_model(self, cls: type[NormT]) -> NormT:
         return cls(
@@ -132,12 +122,10 @@ def test_grouped_rmsnorm_equivalence_randomized(
 
     y_impl = impl(x_impl, m_splits)
     y_ref = ref_impl(x_ref, m_splits)
-    torch.testing.assert_close(y_impl, y_ref, **config.tolerance)
+    torch.testing.assert_close(y_impl, y_ref)
 
     grad_output = torch.randn_like(y_impl)
     y_impl.backward(grad_output)
     y_ref.backward(grad_output)
-    torch.testing.assert_close(x_impl.grad, x_ref.grad, **config.tolerance)
-    torch.testing.assert_close(
-        impl.weight.grad, ref_impl.weight.grad, **config.tolerance
-    )
+    torch.testing.assert_close(x_impl.grad, x_ref.grad)
+    torch.testing.assert_close(impl.weight.grad, ref_impl.weight.grad)
