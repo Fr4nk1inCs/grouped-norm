@@ -58,74 +58,9 @@ def _grouped_rmsnorm_fwd_kernel(
 
 
 @triton.jit
-def _grouped_rmsnorm_bwd_dgamma_phase1(
-    dGamma_partial,  # out [B, H]
-    dY,  # in [B, H]
-    X,  # in [B, H]
-    Rstd,  # in [B]
-    stride_dgammap_b: tl.constexpr,
-    stride_dgammap_h: tl.constexpr,
-    stride_dy_b: tl.constexpr,
-    stride_dy_h: tl.constexpr,
-    stride_x_b: tl.constexpr,
-    stride_x_h: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    tl.assume(BLOCK_SIZE >= HIDDEN_SIZE)
-
-    row_id = tl.program_id(0)
-
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < HIDDEN_SIZE
-
-    out_base = dGamma_partial + row_id * stride_dgammap_b
-    dy_base = dY + row_id * stride_dy_b
-    x_base = X + row_id * stride_x_b
-
-    dy = _load_row(dy_base, cols, stride_dy_h, mask)
-    x = _load_row(x_base, cols, stride_x_h, mask)
-    rstd = tl.load(Rstd + row_id)
-
-    out = dy * x * rstd
-    tl.store(out_base + cols * stride_dgammap_h, out, mask=mask)
-
-
-@triton.jit
-def _grouped_rmsnorm_bwd_dgamma_phase2(
-    dGamma,  # out [G, H]
-    dGamma_partial,  # in [B, H]
-    SegIndptr,  # in [G + 1], starting at 0, end at B
-    stride_dgamma_g: tl.constexpr,
-    stride_dgamma_h: tl.constexpr,
-    stride_dgammap_b: tl.constexpr,
-    stride_dgammap_h: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    group_id = tl.program_id(0)
-    col_id = tl.program_id(1)
-
-    dgammap_base_ptr = dGamma_partial + col_id * stride_dgammap_h
-    row_start = tl.load(SegIndptr + group_id)
-    row_end = tl.load(SegIndptr + group_id + 1)
-
-    dgamma = 0.0
-    for blk_start in tl.range(row_start, row_end, BLOCK_SIZE):
-        offs = tl.arange(0, BLOCK_SIZE) + blk_start
-        mask = offs < row_end
-
-        partial_ptrs = dgammap_base_ptr + offs * stride_dgammap_b
-        partial = tl.load(partial_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-        dgamma += tl.sum(partial, axis=0)
-
-    dgamma_ptr = dGamma + group_id * stride_dgamma_g + col_id * stride_dgamma_h
-    tl.store(dgamma_ptr, dgamma)
-
-
-@triton.jit
-def _grouped_rmsnorm_bwd_dx_kernel(
+def _grouped_rmsnorm_bwd_dx_dgamma_fused_kernel(
     dX,  # out [B, H]
+    dGammaPartial,  # out [B, H]
     dY,  # in [B, H]
     X,  # in [B, H]
     Gamma,  # in [G, H]
@@ -133,6 +68,8 @@ def _grouped_rmsnorm_bwd_dx_kernel(
     SegIndptr,  # in [G + 1], starting at 0, end at B
     stride_dx_b: tl.constexpr,
     stride_dx_h: tl.constexpr,
+    stride_dgammap_b: tl.constexpr,
+    stride_dgammap_h: tl.constexpr,
     stride_dy_b: tl.constexpr,
     stride_dy_h: tl.constexpr,
     stride_x_b: tl.constexpr,
@@ -155,7 +92,10 @@ def _grouped_rmsnorm_bwd_dx_kernel(
 
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < HIDDEN_SIZE
+
     dx_base = dX + row_id * stride_dx_b
+    dgammap_base = dGammaPartial + row_id * stride_dgammap_b
+
     dy_base = dY + row_id * stride_dy_b
     x_base = X + row_id * stride_x_b
     gamma_base = Gamma + group_id * stride_gamma_g
@@ -164,11 +104,47 @@ def _grouped_rmsnorm_bwd_dx_kernel(
     x = _load_row(x_base, cols, stride_x_h, mask)
     gamma = _load_row(gamma_base, cols, stride_gamma_h, mask)
     rstd = tl.load(Rstd + row_id)
+
     x_hat = x * rstd
     dy_hat = dy * gamma
 
     dx = rstd * (dy_hat - x_hat * tl.sum(dy_hat * x_hat, axis=0) / HIDDEN_SIZE)
     tl.store(dx_base + cols * stride_dx_h, dx, mask=mask)
+
+    dgamma = dy * x_hat
+    tl.store(dgammap_base + cols * stride_dgammap_h, dgamma, mask=mask)
+
+
+@triton.jit
+def _grouped_rmsnorm_bwd_accumulate_dgamma_kernel(
+    dGamma,  # out [G, H]
+    dGammaPartial,  # in [B, H]
+    SegIndptr,  # in [G + 1], starting at 0, end at B
+    stride_dgamma_g: tl.constexpr,
+    stride_dgamma_h: tl.constexpr,
+    stride_dgammap_b: tl.constexpr,
+    stride_dgammap_h: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    col_id = tl.program_id(1)
+
+    dgammap_base = dGammaPartial + col_id * stride_dgammap_h
+    row_start = tl.load(SegIndptr + group_id)
+    row_end = tl.load(SegIndptr + group_id + 1)
+
+    dgamma = 0.0
+    for blk_start in tl.range(row_start, row_end, BLOCK_SIZE):
+        offs = tl.arange(0, BLOCK_SIZE) + blk_start
+        mask = offs < row_end
+
+        partial_ptrs = dgammap_base + offs * stride_dgammap_b
+        partial = tl.load(partial_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        dgamma += tl.sum(partial, axis=0)
+
+    dgamma_ptr = dGamma + group_id * stride_dgamma_g + col_id * stride_dgamma_h
+    tl.store(dgamma_ptr, dgamma)
 
 
 @triton.jit
@@ -271,8 +247,9 @@ class GroupedRMSNormFunction(torch.autograd.Function):
         dgamma_partial = torch.empty_like(x, dtype=torch.float32)
         dgamma = torch.empty_like(gamma)
 
-        _grouped_rmsnorm_bwd_dx_kernel[(g, max_split)](
+        _grouped_rmsnorm_bwd_dx_dgamma_fused_kernel[(g, max_split)](
             dx,
+            dgamma_partial,
             dy,
             x,
             gamma,
@@ -280,6 +257,8 @@ class GroupedRMSNormFunction(torch.autograd.Function):
             seg_indptr,
             dx.stride(0),
             dx.stride(1),
+            dgamma_partial.stride(0),
+            dgamma_partial.stride(1),
             dy.stride(0),
             dy.stride(1),
             x.stride(0),
@@ -291,25 +270,9 @@ class GroupedRMSNormFunction(torch.autograd.Function):
             num_warps=num_warps,
         )
 
-        _grouped_rmsnorm_bwd_dgamma_phase1[(b,)](
-            dgamma_partial,
-            dy,
-            x,
-            rstd,
-            dgamma_partial.stride(0),
-            dgamma_partial.stride(1),
-            dy.stride(0),
-            dy.stride(1),
-            x.stride(0),
-            x.stride(1),
-            h,
-            BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-
-        PHASE2_BLOCK_SIZE = triton.next_power_of_2(max_split)
-        phase2_num_warps = max(4, min(16, PHASE2_BLOCK_SIZE // 256))
-        _grouped_rmsnorm_bwd_dgamma_phase2[(g, h)](
+        ACC_BLOCK_SIZE = triton.next_power_of_2(max_split)
+        acc_num_warps = max(4, min(16, ACC_BLOCK_SIZE // 256))
+        _grouped_rmsnorm_bwd_accumulate_dgamma_kernel[(g, h)](
             dgamma,
             dgamma_partial,
             seg_indptr,
@@ -317,8 +280,8 @@ class GroupedRMSNormFunction(torch.autograd.Function):
             dgamma.stride(1),
             dgamma_partial.stride(0),
             dgamma_partial.stride(1),
-            PHASE2_BLOCK_SIZE,
-            num_warps=phase2_num_warps,
+            ACC_BLOCK_SIZE,
+            num_warps=acc_num_warps,
         )
 
         return dx, dgamma, None, None
