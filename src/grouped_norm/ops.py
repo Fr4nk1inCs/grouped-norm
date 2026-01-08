@@ -27,6 +27,8 @@ def _grouped_rmsnorm_fwd_kernel(
     EPS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    tl.assume(BLOCK_SIZE >= HIDDEN_SIZE)
+
     group_id = tl.program_id(0)
     row_in_group = tl.program_id(1)
     row_start = tl.load(SegIndptr + group_id)
@@ -36,8 +38,6 @@ def _grouped_rmsnorm_fwd_kernel(
     if row_id >= row_end:
         return
 
-    tl.assume(BLOCK_SIZE >= HIDDEN_SIZE)
-
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < HIDDEN_SIZE
 
@@ -45,7 +45,7 @@ def _grouped_rmsnorm_fwd_kernel(
     y_base = Y + row_id * stride_out_b
     gamma_base = Gamma + group_id * stride_gamma_g
 
-    x = _load_row(x_base, cols, stride_in_h, mask)
+    x = _load_row(x_base, cols, stride_in_h, mask).to(tl.float32)
     gamma = _load_row(gamma_base, cols, stride_gamma_h, mask)
 
     x_sq = x * x
@@ -105,21 +105,16 @@ def _grouped_rmsnorm_bwd_dgamma_phase2(
     group_id = tl.program_id(0)
     col_id = tl.program_id(1)
 
+    dgammap_base_ptr = dGamma_partial + col_id * stride_dgammap_h
     row_start = tl.load(SegIndptr + group_id)
     row_end = tl.load(SegIndptr + group_id + 1)
 
-    blk_start = row_start // BLOCK_SIZE
-    blk_end = tl.cdiv(row_end, BLOCK_SIZE)
-
     dgamma = 0.0
-    for blk_id in tl.range(blk_start, blk_end):
-        row_base = blk_id * BLOCK_SIZE
-        rows = tl.arange(0, BLOCK_SIZE) + row_base
-        mask = (rows >= row_start) & (rows < row_end)
+    for blk_start in tl.range(row_start, row_end, BLOCK_SIZE):
+        offs = tl.arange(0, BLOCK_SIZE) + blk_start
+        mask = offs < row_end
 
-        partial_ptrs = (
-            dGamma_partial + rows * stride_dgammap_b + col_id * stride_dgammap_h
-        )
+        partial_ptrs = dgammap_base_ptr + offs * stride_dgammap_b
         partial = tl.load(partial_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         dgamma += tl.sum(partial, axis=0)
@@ -233,7 +228,7 @@ class GroupedRMSNormFunction(torch.autograd.Function):
         assert max_split > 0, "All splits are zero."
 
         y = torch.empty_like(x)
-        rstd = torch.empty(b, dtype=x.dtype, device=device)
+        rstd = torch.empty(b, dtype=torch.float32, device=device)
 
         BLOCK_SIZE = triton.next_power_of_2(h)
         num_warps = max(4, min(16, BLOCK_SIZE // 256))
@@ -273,7 +268,7 @@ class GroupedRMSNormFunction(torch.autograd.Function):
         g = gamma.shape[0]
 
         dx = torch.empty_like(x)
-        dgamma_partial = torch.empty_like(x)
+        dgamma_partial = torch.empty_like(x, dtype=torch.float32)
         dgamma = torch.empty_like(gamma)
 
         _grouped_rmsnorm_bwd_dx_kernel[(g, max_split)](
