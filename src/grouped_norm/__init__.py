@@ -47,4 +47,4 @@ class GroupedRMSNorm(GroupedNorm):
         return grouped_rmsnorm(x, self.weight, m_splits, self.eps)
 
     def extra_repr(self):
-        return f"num_norms={self.num_norms}, hidden_size={self.hidden_size}, eps={self.eps}"
+        return f"num_norms={self.num_norms}, hidden_size={self.hidden_size}, eps={self.eps}, dtype={self.dtype}"
